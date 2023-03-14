@@ -2,21 +2,25 @@ package org.chipsalliance.tilelink.tlaurora
 
 import chisel3._
 import chisel3.experimental.{SerializableModule, SerializableModuleParameter}
-import chisel3.util.{Decoupled, DecoupledIO}
-import org.chipsalliance.tilelink.bundle.{TLChannelA, TLChannelB, TLChannelC, TLChannelD, TLChannelE, TLLink, TLLinkParameter}
+import chisel3.util.Decoupled
+import org.chipsalliance.tilelink.bundle.{TLLink, TLLinkParameter}
 
 case class TLToAuroraParameters(
-    masterLinkParameters: TLLinkParameter,
-    slaveLinkParameters: TLLinkParameter,
-    // The number of octets in a User PDU
-    userPDUOctets: Int,
-    laneSize: Int
-                               ) extends SerializableModuleParameter {
-  assert(laneSize == 1, "only support 1 lane for now.")
+  masterLinkParameters: TLLinkParameter,
+  slaveLinkParameters:  TLLinkParameter,
+  serializerScheme:     TLSerializerScheme,
+  mshrSlots:            Int)
+    extends SerializableModuleParameter {
+  require(serializerScheme == TLUHNoAtomic, "Only support TLUHNoAtomic scheme for now")
+  serializerScheme match {
+    case TLUHNoAtomic =>
+      require(!masterLinkParameters.hasBCEChannels, "TLUHNoAtomic doesn't support BCE channel")
+    case TLUH =>
+    case TLC  =>
+  }
 }
 
-class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule
-  with SerializableModule[TLToAuroraParameters] {
+class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with SerializableModule[TLToAuroraParameters] {
   // IOs
   // TileLink TX Clock Domain
   val txBusClock = IO(Input(Clock()))
@@ -50,24 +54,79 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule
   def rxAuroraDomain[T](unit: => T): T = { withClockAndReset(rxAuroraClock, rxAuroraReset) { unit } }
 
   // Module
-  val tx = Module(new TX(TXParameters(parameter.masterLinkParameters, parameter.slaveLinkParameters)))
-  val rx = Module(new RX(RXParameters(parameter.masterLinkParameters, parameter.slaveLinkParameters)))
-  val retransmitQueue = Module(new RetransmissionQueue)
+  // Master
+  val sourceA = txBusDomain(
+    Module(
+      new SourceA(
+        SourceAParameters(
+          parameter.masterLinkParameters.channelAParameter,
+          parameter.serializerScheme
+        )
+      )
+    )
+  )
+  val sinkD = txBusDomain(
+    Module(
+      new SinkD(
+        SinkDParameters(
+          parameter.masterLinkParameters.channelDParameter,
+          parameter.serializerScheme
+        )
+      )
+    )
+  )
+  val sinkA = rxBusDomain(
+    Module(
+      new SinkA(
+        SinkAParameters(
+          parameter.slaveLinkParameters.channelAParameter,
+          parameter.serializerScheme
+        )
+      )
+    )
+  )
+  val sourceD = rxBusDomain(
+    Module(
+      new SourceD(
+        SourceDParameters(
+          parameter.slaveLinkParameters.channelDParameter,
+          parameter.serializerScheme
+        )
+      )
+    )
+  )
+
+  /** Notice there is a tricky issue about clock crossing:
+    * mshr is in txBus clock domain, [[sinkA]] and [[sourceD]] is connected to which.
+    */
+  val mshr = txBusDomain(
+    Module(
+      new MSHR(
+        MSHRParameters(
+          parameter.mshrSlots,
+          parameter.serializerScheme
+        )
+      )
+    )
+  )
 
   // Connection
   // TileLink Master
-  tx.masterAChannel :<>= masterLink.a
-  rx.masterBChannel.foreach(masterLink.b :<>= _)
-  tx.masterCChannel.foreach(_ :<>= masterLink.c)
-  masterLink.d :<>= rx.masterDChannel
-  tx.masterEChannel.foreach(_ :<>= masterLink.e)
+  sourceA.masterAChannel :<>= masterLink.a
+  masterLink.d :<>= sinkD.masterDChannel
 
   // TileLink Slave
-  slaveLink.a <>= rx.slaveAChannel
-  tx.slaveBChannel.foreach(_ :<>= slaveLink.b)
-  rx.slaveCChannel.foreach(slaveLink.c <>= _)
-  tx.slaveDChannel :<>= slaveLink.d
-  rx.slaveEChannel.foreach(slaveLink.e <>= _)
+  slaveLink.a :<>= sinkA.slaveAChannel
+  sourceD.slaveDChannel :<>= slaveLink.d
+
+  // MSHR
+  mshr.sourceA :<>= sourceA.mshrIO
+  mshr.sinkD :<>= sinkD.mshrIO
+  // TODO: add AsyncQueue for clock crossing
+  mshr.sourceD :<>= sourceD.mshrIO
+  mshr.sinkA :<>= sinkA.mshrIO
+
+  // Aurora TX
 }
 
 /** This design borrows idea from OmniXtend-1.0.3 Chapter 4. Retransmission. */
