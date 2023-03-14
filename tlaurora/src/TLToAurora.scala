@@ -55,6 +55,21 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
   def rxAuroraDomain[T](unit: => T): T = { withClockAndReset(rxAuroraClock, rxAuroraReset) { unit } }
 
   // Module
+  /*
+   *
+   *             Tokenizer-------------------------------------AQ-> User FC PDU
+   *                 |                 |
+   * SourceA --->    |                 |
+   *              PDUMux -----> RetransmissionQueue -----------AQ-> User PDU
+   * SourceD --->                      |       |
+   *                                   |       AQ
+   *                                   ------------------------AQ-< User FC PDU
+   * SinkA <----                               |
+   *              Arbiter ----------------- Decoder <----------AQ-< User PDU
+   * SinkD <----
+   *
+   *
+   */
   // Master
   val sourceA = txBusDomain(
     Module(
@@ -112,6 +127,9 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
 
   // Aurora TX
 }
+
+class PDUMux extends Module
+
 
 /** This design borrows idea from OmniXtend-1.0.3 Chapter 4. Retransmission. */
 class RetransmissionQueue extends Module
