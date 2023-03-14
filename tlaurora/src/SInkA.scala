@@ -7,10 +7,11 @@ import org.chipsalliance.tilelink.bundle.{TLChannelA, TileLinkChannelAParameter}
 
 case class SinkAParameters(
   tileLinkChannelAParameter: TileLinkChannelAParameter,
-  scheme:                    TLSerializerScheme)
+  scheme:                    TLSerializerScheme,
+  userPDUWidth:              Int)
     extends SerializableModuleParameter
 
 class SinkA(val parameter: SinkAParameters) extends Module with SerializableModule[SinkAParameters] {
   val slaveAChannel = IO(Flipped(DecoupledIO(new TLChannelA(parameter.tileLinkChannelAParameter))))
-  val mshrIO = IO(DecoupledIO(new MSHRSinkA))
+  val pdu = IO(Output(UInt(parameter.userPDUWidth.W)))
 }

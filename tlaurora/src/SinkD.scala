@@ -7,10 +7,12 @@ import org.chipsalliance.tilelink.bundle.{TLChannelA, TLChannelD, TileLinkChanne
 
 case class SinkDParameters(
   tileLinkChannelDParameter: TileLinkChannelDParameter,
-  scheme:                    TLSerializerScheme)
+  scheme:                    TLSerializerScheme,
+  userPDUWidth:              Int)
     extends SerializableModuleParameter
 
 class SinkD(val parameter: SinkDParameters) extends Module with SerializableModule[SinkDParameters] {
   val masterDChannel = IO(Flipped(DecoupledIO(new TLChannelD(parameter.tileLinkChannelDParameter))))
-  val mshrIO = IO(DecoupledIO(new MSHRSinkD))
+  val pdu = IO(Output(UInt(parameter.userPDUWidth.W)))
+
 }

@@ -9,8 +9,9 @@ case class TLToAuroraParameters(
   masterLinkParameters: TLLinkParameter,
   slaveLinkParameters:  TLLinkParameter,
   serializerScheme:     TLSerializerScheme,
-  mshrSlots:            Int)
+  userPDUWidth:         Int)
     extends SerializableModuleParameter {
+  require(userPDUWidth % 8 == 0, "userPDUWidth must be multiple of 8")
   require(serializerScheme == TLUHNoAtomic, "Only support TLUHNoAtomic scheme for now")
   serializerScheme match {
     case TLUHNoAtomic =>
@@ -60,7 +61,8 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
       new SourceA(
         SourceAParameters(
           parameter.masterLinkParameters.channelAParameter,
-          parameter.serializerScheme
+          parameter.serializerScheme,
+          parameter.userPDUWidth
         )
       )
     )
@@ -70,7 +72,8 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
       new SinkD(
         SinkDParameters(
           parameter.masterLinkParameters.channelDParameter,
-          parameter.serializerScheme
+          parameter.serializerScheme,
+          parameter.userPDUWidth
         )
       )
     )
@@ -80,7 +83,8 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
       new SinkA(
         SinkAParameters(
           parameter.slaveLinkParameters.channelAParameter,
-          parameter.serializerScheme
+          parameter.serializerScheme,
+          parameter.userPDUWidth
         )
       )
     )
@@ -90,21 +94,8 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
       new SourceD(
         SourceDParameters(
           parameter.slaveLinkParameters.channelDParameter,
-          parameter.serializerScheme
-        )
-      )
-    )
-  )
-
-  /** Notice there is a tricky issue about clock crossing:
-    * mshr is in txBus clock domain, [[sinkA]] and [[sourceD]] is connected to which.
-    */
-  val mshr = txBusDomain(
-    Module(
-      new MSHR(
-        MSHRParameters(
-          parameter.mshrSlots,
-          parameter.serializerScheme
+          parameter.serializerScheme,
+          parameter.userPDUWidth
         )
       )
     )
@@ -119,18 +110,9 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
   slaveLink.a :<>= sinkA.slaveAChannel
   sourceD.slaveDChannel :<>= slaveLink.d
 
-  // MSHR
-  mshr.sourceA :<>= sourceA.mshrIO
-  mshr.sinkD :<>= sinkD.mshrIO
-  // TODO: add AsyncQueue for clock crossing
-  mshr.sourceD :<>= sourceD.mshrIO
-  mshr.sinkA :<>= sinkA.mshrIO
-
   // Aurora TX
 }
 
 /** This design borrows idea from OmniXtend-1.0.3 Chapter 4. Retransmission. */
 class RetransmissionQueue extends Module
 class UserFlowControlMessages extends Bundle
-
-class UserPDUs extends Bundle
