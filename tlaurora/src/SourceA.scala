@@ -2,61 +2,68 @@ package org.chipsalliance.tilelink.tlaurora
 
 import chisel3._
 import chisel3.experimental.{SerializableModule, SerializableModuleParameter}
-import chisel3.util.{log2Ceil, DecoupledIO, MuxLookup}
+import chisel3.util.{log2Ceil, DecoupledIO, MuxLookup, RegEnable}
 import org.chipsalliance.tilelink.bundle.{OpCode, TLChannelA, TileLinkChannelAParameter}
 
-case class SourceAParameters(tileLinkChannelAParameter: TileLinkChannelAParameter,
-                              scheme: TLSerializerScheme,
-                              userPDUWidth: Int)
-  extends SerializableModuleParameter {
+case class SourceAParameters(
+  tileLinkChannelAParameter: TileLinkChannelAParameter,
+  scheme:                    TLSerializerScheme,
+  userPDUWidth:              Int)
+    extends SerializableModuleParameter {
   require(tileLinkChannelAParameter.sizeWidth <= 4, "Size width should be less than 4")
 
   def getSize = (8 + // metadata
     tileLinkChannelAParameter.sourceWidth + // source
     tileLinkChannelAParameter.addressWidth // address
-    ) / userPDUWidth
+  ) / userPDUWidth
 
   def putFullDataSize = (8 + // metadata
     tileLinkChannelAParameter.sourceWidth + // source
     tileLinkChannelAParameter.addressWidth + // address
     tileLinkChannelAParameter.dataWidth // data
-    ) / userPDUWidth
+  ) / userPDUWidth
 
   def putPartialDataSize = (8 + // metadata
     tileLinkChannelAParameter.sourceWidth + // source
     tileLinkChannelAParameter.addressWidth + // address
     tileLinkChannelAParameter.dataWidth + // data
     tileLinkChannelAParameter.dataWidth / 8 // mask
-    ) / userPDUWidth
+  ) / userPDUWidth
 
   def maxSize = Seq(getSize, putFullDataSize, putPartialDataSize).max
 }
 
+/** This module should under the txBus clock domain.
+  *
+  * The behavior of this [[SourceA]]:
+  * [[SourceA]] maintains a [[latchMessage]] to latch the [[latchMessage]] when [[masterAChannel.fire]],
+  * after [[masterAChannel.fire]]:
+  *  - [[counter]] set the size of serializing [[octets]] and start to count down;
+  *  - [[pdu.bits]] will be dynamic selected from [[latchMessage]] based on [[counter]];
+  *  - after [[counter]] turns back to 0, [[pdu.valid]] should be deasserted, and [[masterAChannel.ready]] should be asserted;
+  * [[masterAChannel.ready]] is asserted when [[counter]] turns back to 0.
+  * [[pdu.valid]] is asserted when [[counter]] is not 0.
+  */
 class SourceA(val parameter: SourceAParameters) extends Module with SerializableModule[SourceAParameters] {
-  val masterAChannel: DecoupledIO[TLChannelA] = IO(Flipped(DecoupledIO(new TLChannelA(parameter.tileLinkChannelAParameter))))
-  val pdu: DecoupledIO[UInt] = IO(DecoupledIO(UInt(parameter.userPDUWidth.W)))
+  val masterAChannel: DecoupledIO[TLChannelA] = IO(
+    Flipped(DecoupledIO(new TLChannelA(parameter.tileLinkChannelAParameter)))
+  )
+  val pdu: DecoupledIO[SourceToPDUMux] = IO(
+    DecoupledIO(new SourceToPDUMux(parameter.userPDUWidth, log2Ceil(parameter.maxSize / parameter.userPDUWidth)))
+  )
 
-  /** counter to log how many octet has been sent out to PDU Queue. */
-  val counter = RegInit(0.U(log2Ceil(parameter.maxSize / parameter.userPDUWidth).W))
+  /** latch from TileLink Message. */
+  val latchMessage: TLChannelA = RegEnable(masterAChannel.bits, masterAChannel.fire)
 
-  /** catch the posedge signal of [[masterAChannel.valid]]. */
-  val clearCounter: Bool = !RegNext(masterAChannel.valid) && masterAChannel.valid || !masterAChannel.valid
+  /** counter to log how many octets has been sent out to PDU Queue. */
+  val counter: UInt = RegInit(0.U(log2Ceil(parameter.maxSize / parameter.userPDUWidth).W))
 
   /** signals on wire */
   val octets: Vec[UInt] = Wire(VecInit.fill(parameter.maxSize / 8)(UInt(8.W)))
 
-  // clear counter when masterAChannel valid has a posedge.
-  // increase counter when pdu is ready.
-  counter := Mux(clearCounter, 0.U, counter + pdu.fire.asUInt)
-
-  // dynamic selection, add a register for [[octets]] if necessary
-  pdu.bits := octets(counter)
-  // couple [[masterAChannel]] to pdu queue.
-  pdu.valid := masterAChannel.valid
-
-  // pull up the ready of [[masterAChannel]] indicate the [[masterAChannel]] is fired.
-  masterAChannel.ready := counter === MuxLookup(
-    masterAChannel.bits.opcode,
+  /** how many PDU will be sent for this TileLink message. */
+  val messagePDUCounts: UInt = MuxLookup(
+    latchMessage.opcode,
     0.U(2.W),
     Seq(
       OpCode.Get -> (parameter.getSize / parameter.userPDUWidth).U,
@@ -65,26 +72,38 @@ class SourceA(val parameter: SourceAParameters) extends Module with Serializable
     )
   )
 
+  counter := Mux(
+    masterAChannel.fire,
+    // set counter to corresponding size of TLMessage.
+    messagePDUCounts,
+    // count down counter when [[pdu.fire]].
+    Mux(counter === 0.U, 0.U, counter - pdu.fire.asUInt)
+  )
+
+  // dynamic selection
+  pdu.bits.userPDU := octets(counter)
+  pdu.bits.size := messagePDUCounts
+
   // package transaction into octets
   octets(0) := 0.U(1.W) ## MuxLookup(
-      masterAChannel.bits.opcode,
-      0.U(2.W),
-      Seq(
-        OpCode.Get -> "b00".U(2.W),
-        OpCode.PutFullData -> "b10".U(2.W),
-        OpCode.PutPartialData -> "b11".U(2.W)
-      )
-    ) ##
-    masterAChannel.bits.corrupt.asBool ##
-    masterAChannel.bits.size.asTypeOf(UInt(4.W))
-  masterAChannel.bits.source.asBools.grouped(8).zipWithIndex.foreach {
+    latchMessage.opcode,
+    0.U(2.W),
+    Seq(
+      OpCode.Get -> "b00".U(2.W),
+      OpCode.PutFullData -> "b10".U(2.W),
+      OpCode.PutPartialData -> "b11".U(2.W)
+    )
+  ) ##
+    latchMessage.corrupt.asBool ##
+    latchMessage.size.asTypeOf(UInt(4.W))
+  latchMessage.source.asBools.grouped(8).zipWithIndex.foreach {
     case (bit, index) =>
       octets(
         1 + // metadata
           index // source
       ) := VecInit(bit).asUInt
   }
-  masterAChannel.bits.address.asBools.grouped(8).zipWithIndex.foreach {
+  latchMessage.address.asBools.grouped(8).zipWithIndex.foreach {
     case (bit, index) =>
       octets(
         1 + // metadata
@@ -92,7 +111,7 @@ class SourceA(val parameter: SourceAParameters) extends Module with Serializable
           index // address
       ) := VecInit(bit).asUInt
   }
-  masterAChannel.bits.data.asBools.grouped(8).zipWithIndex.foreach {
+  latchMessage.data.asBools.grouped(8).zipWithIndex.foreach {
     case (bit, index) =>
       octets(
         1 + // metadata
@@ -101,7 +120,7 @@ class SourceA(val parameter: SourceAParameters) extends Module with Serializable
           index // data
       ) := VecInit(bit).asUInt
   }
-  masterAChannel.bits.mask.asBools.grouped(8).zipWithIndex.foreach {
+  latchMessage.mask.asBools.grouped(8).zipWithIndex.foreach {
     case (bit, index) =>
       octets(
         1 + // metadata

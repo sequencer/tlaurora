@@ -9,7 +9,9 @@ case class TLToAuroraParameters(
   masterLinkParameters: TLLinkParameter,
   slaveLinkParameters:  TLLinkParameter,
   serializerScheme:     TLSerializerScheme,
-  userPDUWidth:         Int)
+  userPDUWidth:         Int,
+  ufcPDUWidth:          Int,
+  retransmitQueueSize:  Int)
     extends SerializableModuleParameter {
   require(userPDUWidth % 8 == 0, "userPDUWidth must be multiple of 8")
   require(serializerScheme == TLUHNoAtomic, "Only support TLUHNoAtomic scheme for now")
@@ -42,8 +44,8 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
   val txAuroraClock = IO(Input(Clock()))
   val txAuroraReset = IO(Input(Reset()))
   // TX Aurora IO under txClock domain
-  val txUserFlowControlMessages = IO(Decoupled(new UserFlowControlMessages))
-  val txUserPDUs = IO(Decoupled(new UserFlowControlMessages))
+  val txUserFlowControlMessages = IO(Decoupled(UInt(parameter.ufcPDUWidth.W)))
+  val txUserPDUs = IO(Decoupled(UInt(parameter.ufcPDUWidth.W)))
   def txAuroraDomain[T](unit: => T): T = { withClockAndReset(txAuroraClock, txAuroraReset) { unit } }
 
   // Aurora RX Clock Domain
@@ -51,7 +53,7 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
   val rxAuroraClock = IO(Input(Clock()))
   val rxAuroraReset = IO(Input(Reset()))
   // RX Aurora IO under rxClock domain
-  val rxUserFlowControlMessages = IO(Flipped(Decoupled(new UserFlowControlMessages)))
+  val rxUserFlowControlMessages = IO(Flipped(Decoupled(UInt(parameter.ufcPDUWidth.W))))
   def rxAuroraDomain[T](unit: => T): T = { withClockAndReset(rxAuroraClock, rxAuroraReset) { unit } }
 
   // Module
@@ -59,11 +61,16 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
    *
    *             Tokenizer-------------------------------------AQ-> User FC PDU
    *                 |                 |
+   *                 |                 |
    * SourceA --->    |                 |
    *              PDUMux -----> RetransmissionQueue -----------AQ-> User PDU
    * SourceD --->                      |       |
+   *                                   |       |
+   *                                   |       |
    *                                   |       AQ
    *                                   ------------------------AQ-< User FC PDU
+   *                                           |
+   *                                           |
    * SinkA <----                               |
    *              Arbiter ----------------- Decoder <----------AQ-< User PDU
    * SinkD <----
@@ -115,6 +122,14 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
       )
     )
   )
+  val pduMux = txBusDomain(Module(new PDUMux(PDUMuxParameters(parameter.userPDUWidth))))
+  val retransmitQueue = Module(
+    new RetransmitQueue(
+      RetransmitQueueParameters(parameter.userPDUWidth, parameter.ufcPDUWidth, parameter.retransmitQueueSize)
+    )
+  )
+  pduMux.sourceA :<>= sourceA.pdu
+  pduMux.sourceD :<>= sourceD.pdu
 
   // Connection
   // TileLink Master
@@ -124,13 +139,4 @@ class TLToAurora(val parameter: TLToAuroraParameters) extends RawModule with Ser
   // TileLink Slave
   slaveLink.a :<>= sinkA.slaveAChannel
   sourceD.slaveDChannel :<>= slaveLink.d
-
-  // Aurora TX
 }
-
-class PDUMux extends Module
-
-
-/** This design borrows idea from OmniXtend-1.0.3 Chapter 4. Retransmission. */
-class RetransmissionQueue extends Module
-class UserFlowControlMessages extends Bundle
